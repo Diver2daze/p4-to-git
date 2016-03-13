@@ -1,0 +1,247 @@
+#!/usr/bin/python
+# A one-way Perforce to Git bridge.
+
+import argparse
+import json
+import logging
+import os
+import subprocess
+import sys
+
+logging.basicConfig(level=logging.DEBUG)
+
+
+def _has_remote_git_branch(git_repo_path, git_branch, remote_name='origin'):
+    """True if a git branch exists on a given remote, False otherwise."""
+    try:
+        # Unfortunately, this is Python 2.
+        with open(os.devnull, 'w') as devnull:
+            subprocess.check_call(
+                ['git', 'rev-parse', '--verify',
+                 '/'.join((remote_name, git_branch))],
+                cwd=git_repo_path, stdout=devnull, stderr=devnull)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _local_equals_remote(git_repo_path, git_branch, remote_name='origin'):
+    """True if the local git branch equals the remote git branch."""
+    # Not equal if the remote branch does not exist at all.
+    local_p4 = _build_branchname(git_branch, 'p4')
+    remote_p4 = '/'.join((remote_name, local_p4))
+    if not _has_remote_git_branch(git_repo_path, local_p4, remote_name):
+        return False
+
+    rev_local = subprocess.check_output(
+        ['git', 'rev-parse', local_p4], cwd=git_repo_path)
+    rev_remote = subprocess.check_output(
+        ['git', 'rev-parse', remote_p4], cwd=git_repo_path)
+    return rev_local == rev_remote
+
+
+def _get_grafts_filepath(git_repo_path):
+    """Get the path to the grafts file for a git repo."""
+    return os.path.join(git_repo_path, '.git', 'info', 'grafts')
+
+
+def _build_p4_spec(p4_base, p4_branch, p4_howmuch):
+    """Build a full p4 spec from parts."""
+    return '{}/{}{}'.format(p4_base, p4_branch, p4_howmuch)
+
+
+def _build_branchname(git_branch, prefix):
+    """Build a branch name with a given prefix."""
+    return '/'.join((prefix, git_branch.replace('/', '_'))).lower()
+
+
+def grafts_rebuild_parents(grafts, overrides):
+    """Fix lonely commits by using the previous commit as parent."""
+    result = []
+    for idx, line in enumerate(grafts):
+        if len(line) >= 2:
+            result.append(line)
+        elif len(line) == 1:
+            if idx+1 == len(grafts):
+                result.append(line)
+            elif line[0] in overrides:
+                result.append([line[0], overrides[line[0]]])
+            else:
+                result.append([line[0], grafts[idx+1][0]])
+    return result
+
+
+def grafts_load(git_repo_path):
+    """Load graft points from a given repository."""
+    logging.debug('Obtaining grafts from: {}.'.format(git_repo_path))
+    output = subprocess.check_output(
+        ['git', 'rev-list', '--parents', '--branches=tmp'],
+        cwd=git_repo_path, universal_newlines=True)
+    return [line.split(' ') for line in output.split('\n') if line]
+
+
+def grafts_save(grafts, git_repo_path):
+    """Save graft points for a given git repository."""
+    path = _get_grafts_filepath(git_repo_path)
+    logging.debug('Saving grafts to: {}.'.format(path))
+    with open(path, 'w') as f:
+        for line in grafts:
+            f.write('{}\n'.format(' '.join(line)))
+
+
+def repo_rebuild_branch_history(git_repo_path, to_rebuild):
+    """Rebuild the branch history with grafts."""
+    logging.debug(
+        'Rebuild history for {} branch(es).'.format(len(to_rebuild)))
+    # We might be on a branch without any commits, therefore switch to an
+    # existing branch.
+    subprocess.check_call(
+        ['git', 'checkout', to_rebuild[0]], cwd=git_repo_path)
+    cmd = ['git', 'filter-branch', '--force', '--']
+    cmd.extend(to_rebuild)
+    subprocess.check_call(cmd, cwd=git_repo_path)
+    os.unlink(_get_grafts_filepath(git_repo_path))
+
+
+def repo_initialize(git_repo_path, git_remote, remote_name='origin'):
+    """Initialize an empty git repository and setup the git remote."""
+    logging.debug('Creating empty git repository: {}.'.format(git_repo_path))
+    subprocess.check_call(['git', 'init', git_repo_path])
+    subprocess.call(
+        ['git', 'remote', 'add', remote_name, git_remote], cwd=git_repo_path)
+    subprocess.check_call(['git', 'fetch', remote_name], cwd=git_repo_path)
+
+
+def repo_sync_with_upstream_p4(git_repo_path, git_branch, p4_spec):
+    """Sync an upstream p4 branch into a local git branch."""
+    logging.debug('Syncing with upstream p4: {}.'.format(p4_spec))
+    local_p4 = _build_branchname(git_branch, 'p4')
+    if _has_remote_git_branch(git_repo_path, local_p4):
+        logging.debug('Updating local p4 branch: {}.'.format(local_p4))
+        subprocess.check_call(['git', 'checkout', local_p4], cwd=git_repo_path)
+        subprocess.check_call(
+            ['git', 'p4', 'sync', '--use-client-spec' ,'--import-local', '--branch', local_p4],
+            cwd=git_repo_path)
+        subprocess.check_call(
+            ['git', 'reset', '--hard', 'HEAD'], cwd=git_repo_path)
+    else:
+        logging.debug('Creating local p4 branch: {}.'.format(local_p4))
+        subprocess.check_call(
+            ['git', 'p4', 'sync', '--use-client-spec', '--import-local', '--branch',
+                local_p4, p4_spec], cwd=git_repo_path)
+
+
+def repo_update_git_branch(git_repo_path, git_branch):
+    """Checkout a git branch."""
+    logging.debug('Updating git branch: {}.'.format(git_branch))
+    local_tmp = _build_branchname(git_branch, 'tmp')
+    if _has_remote_git_branch(git_repo_path, git_branch):
+        subprocess.check_call(
+            ['git', 'checkout', git_branch], cwd=git_repo_path)
+        subprocess.check_call(
+            ['git', 'merge', '--ff-only', local_tmp], cwd=git_repo_path)
+    else:
+        subprocess.check_call(
+            ['git', 'checkout', '-b', git_branch, local_tmp],
+            cwd=git_repo_path)
+
+
+def repo_create_temporary_branch(git_repo_path, git_branch):
+    """Create a temporary git branch from a local p4 branch."""
+    local_tmp = _build_branchname(git_branch, 'tmp')
+    local_p4 = _build_branchname(git_branch, 'p4')
+    logging.debug('Creating temporary branch: {}.'.format(local_tmp))
+    subprocess.check_call(
+        ['git', 'branch', local_tmp, local_p4], cwd=git_repo_path)
+
+
+def repo_delete_temporary_branch(git_repo_path, git_branch):
+    """Delete a git branch."""
+    logging.debug('Deleting git branch: {}.'.format(git_branch))
+    local_tmp = _build_branchname(git_branch, 'tmp')
+    subprocess.check_call(['git', 'checkout', git_branch], cwd=git_repo_path)
+    subprocess.check_call(
+        ['git', 'branch', '-D', local_tmp], cwd=git_repo_path)
+
+
+def repo_push_to_remote(git_repo_path, remote_name='origin'):
+    """Push the local repository to the remote."""
+    logging.debug('Pushing to remote repository.')
+    subprocess.check_call(
+        ['git', 'push', remote_name, '--all'], cwd=git_repo_path)
+
+
+def sync_repository(config):
+    """Sync a repository."""
+
+    # Initialize the git repository.
+    repo_initialize(config['git_repo_path'], config['git_remote'])
+
+    # Sync all branches.
+    for p4_branch, git_branch in config['branches']:
+        repo_sync_with_upstream_p4(
+            config['git_repo_path'], git_branch,
+            _build_p4_spec(config['p4_base'], p4_branch, config['p4_howmuch']))
+
+    # Find all branches that require further processing.
+    with_updates = []
+    for _, git_branch in config['branches']:
+        diff = not _local_equals_remote(config['git_repo_path'], git_branch)
+        logging.debug('Git branch {} has updates: {}'.format(git_branch, diff))
+        if diff:
+            with_updates.append(git_branch)
+
+    # Find all branches that require history rewriting using grafts.
+    # Those are all branches with updates and, if any, the base rewrite branch.
+    to_rebuild = {branch: _build_branchname(branch, 'tmp')
+                  for branch in with_updates
+                  if branch not in config['ignore_rewrite_branches']}
+    if to_rebuild and config['base_rewrite_branch'] not in to_rebuild:
+        to_rebuild[config['base_rewrite_branch']] = \
+            _build_branchname(config['base_rewrite_branch'], 'tmp')
+
+    # Rebuild history.
+    if to_rebuild:
+        # Create a temporary branch for each branch to be rebuilt.
+        for git_branch in to_rebuild.keys():
+            repo_create_temporary_branch(config['git_repo_path'], git_branch)
+
+        # Rebuild history.
+        grafts = grafts_load(config['git_repo_path'])
+        new_grafts = grafts_rebuild_parents(grafts, config['graft_overrides'])
+        grafts_save(new_grafts, config['git_repo_path'])
+        repo_rebuild_branch_history(
+            config['git_repo_path'], to_rebuild.values())
+
+        # Update permanent git branches and cleanup temporary branches.
+        for git_branch in to_rebuild.keys():
+            repo_update_git_branch(config['git_repo_path'], git_branch)
+            repo_delete_temporary_branch(config['git_repo_path'], git_branch)
+
+        # Push results to the remote repository.
+        repo_push_to_remote(config['git_repo_path'])
+
+
+def main():
+    """main."""
+    # Parser
+    parser = argparse.ArgumentParser(
+        description='A one-way Perforce to Git bridge.')
+    parser.add_argument(
+        '-c', '--config', nargs='?', type=argparse.FileType('r'),
+        default=sys.stdin, help='the json configuration file to use.')
+    args = parser.parse_args()
+
+    # Parse config
+    try:
+        config = json.load(args.config)
+        sync_repository(config)
+    except ValueError, exc:
+        logging.error(
+            'Error in config file: {}'.format(args.config.name))
+        logging.exception(exc)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

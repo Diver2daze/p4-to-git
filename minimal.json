@@ -1,0 +1,12 @@
+{
+  "git_remote": "https://dmitry.kurishev@gitclone.corp.acronis.com/scm/aa/load_tests.git",
+  "git_repo_path": "load_tests",
+  "p4_base": "//P2/Server/TRUNK/",
+  "p4_howmuch": "@all",
+  "branches": [
+    ["Components/Load Tests/", "master"]
+  ],
+  "base_rewrite_branch": "master",
+  "graft_overrides": {},
+  "ignore_rewrite_branches": []
+}
